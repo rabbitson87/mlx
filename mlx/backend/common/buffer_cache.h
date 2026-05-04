@@ -56,7 +56,10 @@ class BufferCache {
   }
 
   int release_cached_buffers(size_t min_bytes_to_free) {
-    if (min_bytes_to_free >= 0.9 * pool_size_) {
+    // [kestrel-rs B-3α] raise bulk-clear threshold 0.9 → 1.0 to avoid
+    // catastrophic pool wipe on partial pressure; falls through to
+    // iterative LRU tail eviction.
+    if (min_bytes_to_free >= pool_size_) {
       return clear();
     } else {
       int n_release = 0;
