@@ -30,8 +30,14 @@ class BufferCache {
   T* reuse_from_cache(size_t size) {
     // Find the closest buffer in pool.
     auto it = buffer_pool_.lower_bound(size);
+    // [kestrel-rs B-3β] loosen reuse matching: 2x → 4x size cap, 2 → 16 page
+    // additive (=256 KB on 16 KB pages). Original strict matching causes
+    // large-buffer cache miss on minor size mismatches (e.g., +33 KB over
+    // a 1 MB request), which forces fresh device allocation. Loosening
+    // raises buffer reuse rate at the cost of larger over-allocation per
+    // reuse. Memory headroom guarded by gc_limit_/block_limit_.
     if (it == buffer_pool_.end() ||
-        it->first >= std::min(2 * size, size + 2 * page_size_)) {
+        it->first >= std::min(4 * size, size + 16 * page_size_)) {
       return nullptr;
     }
 
