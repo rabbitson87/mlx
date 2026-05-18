@@ -555,6 +555,8 @@ void CommandEncoder::commit(std::function<void()> completion) {
           }
         }
       });
+  // lumen-rs: ops per committed command buffer, a proxy for batching quality.
+  device_.note_cmd_buffer_commit(buffer_ops_);
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
@@ -887,10 +889,13 @@ MTL::ComputePipelineState* Device::get_kernel(
     if (library_it != library_kernels_.end()) {
       auto kernel_it = library_it->second.find(kname);
       if (kernel_it != library_it->second.end()) {
+        kernel_cache_hits_.fetch_add(1, std::memory_order_relaxed);
         return kernel_it->second.get();
       }
     }
   }
+  // Cache miss — compile path (expensive, ~ms per new shape specialization).
+  kernel_cache_misses_.fetch_add(1, std::memory_order_relaxed);
   return get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
 }
 

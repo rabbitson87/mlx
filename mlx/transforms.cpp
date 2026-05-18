@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -270,7 +271,47 @@ array eval_impl(std::vector<array> outputs, bool async) {
       }
 
       if (arr.primitive().device() == Device::gpu) {
+        // lumen-rs Phase 1.5 Step E (mlx-c FFI / encode hypothesis):
+        // accumulate per-primitive gpu::eval wall time across all decode
+        // steps. This is the synchronous CPU work that mlx_async_eval
+        // pays before returning. If our total gpu::eval time / step is
+        // 2× mlx-lm's, the encode CPU path is the bottleneck.
+        auto _eval_t0 = std::chrono::steady_clock::now();
         gpu::eval(arr);
+        auto _eval_t1 = std::chrono::steady_clock::now();
+        mlx::core::scheduler::g_eval_gpu_calls.fetch_add(
+            1, std::memory_order_relaxed);
+        mlx::core::scheduler::g_eval_gpu_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                _eval_t1 - _eval_t0)
+                .count(),
+            std::memory_order_relaxed);
+        // Step F (primitive-type histogram).
+        const char* _prim_name = arr.primitive().name();
+        mlx::core::scheduler::prim_hist_record(_prim_name);
+        mlx::core::scheduler::prim_hist_dyn_record(_prim_name);
+        // Step F3 — AsType dtype-pair counters.
+        if (_prim_name != nullptr &&
+            std::strcmp(_prim_name, "AsType") == 0 &&
+            !arr.inputs().empty()) {
+          auto from = arr.inputs()[0].dtype();
+          auto to = arr.dtype();
+          if (from == to) {
+            mlx::core::scheduler::g_astype_noop.fetch_add(
+                1, std::memory_order_relaxed);
+          } else if (from.val() == Dtype::Val::bfloat16 &&
+                     to.val() == Dtype::Val::float32) {
+            mlx::core::scheduler::g_astype_bf16_to_f32.fetch_add(
+                1, std::memory_order_relaxed);
+          } else if (from.val() == Dtype::Val::float32 &&
+                     to.val() == Dtype::Val::bfloat16) {
+            mlx::core::scheduler::g_astype_f32_to_bf16.fetch_add(
+                1, std::memory_order_relaxed);
+          } else {
+            mlx::core::scheduler::g_astype_other_pair.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
       } else {
         cpu::eval(arr);
       }
@@ -1121,3 +1162,41 @@ std::function<std::vector<array>(const std::vector<array>&)> checkpoint(
 }
 
 } // namespace mlx::core
+
+// lumen-rs Phase 1.6 — extern "C" public entry points for the
+// scheduler-level instrumentation counters. Mirrors the pattern in
+// `mlx/fast.cpp` (mlx_dump_sdpa_timing) so macOS ld does not dead-strip
+// the namespace-internal helpers in libmlx.a, and Python ctypes can call
+// them directly via `dlsym(mlx.core .so, "mlx_*")`.
+//
+// Used by `mlx_runner.py` to read per-decode-step op counts from the
+// PyO3 / Python path for apples-to-apples comparison with the Rust
+// native path (which reads the same counters via `mlx_rs::metal::*`).
+extern "C" __attribute__((visibility("default"), used)) uint64_t
+mlx_eval_gpu_calls_get(void) {
+  return mlx::core::scheduler::g_eval_gpu_calls.load(
+      std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) uint64_t
+mlx_eval_gpu_ns_get(void) {
+  return mlx::core::scheduler::g_eval_gpu_ns.load(
+      std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) void
+mlx_eval_gpu_stats_reset(void) {
+  mlx::core::scheduler::g_eval_gpu_calls.store(
+      0, std::memory_order_relaxed);
+  mlx::core::scheduler::g_eval_gpu_ns.store(0, std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
+mlx_prim_hist_dyn_dump_buf(char* buf, int buf_size) {
+  return mlx::core::scheduler::prim_hist_dyn_dump(buf, buf_size);
+}
+
+extern "C" __attribute__((visibility("default"), used)) void
+mlx_prim_hist_dyn_reset_buf(void) {
+  mlx::core::scheduler::prim_hist_dyn_reset();
+}

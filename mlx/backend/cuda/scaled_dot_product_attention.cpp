@@ -586,6 +586,7 @@ bool ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     bool force_fused,
+    int /* window_size */,
     Stream s) {
   auto [has_fused, reason] =
       has_fused_kernel(q, k, v, has_arr_mask, do_causal, output_logsumexp, s);

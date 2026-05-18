@@ -33,6 +33,7 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     bool force_fused,
+    int /* window_size */,
     Stream s) {
   if (force_fused) {
     throw std::invalid_argument(

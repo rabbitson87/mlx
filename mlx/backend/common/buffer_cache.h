@@ -30,7 +30,7 @@ class BufferCache {
   T* reuse_from_cache(size_t size) {
     // Find the closest buffer in pool.
     auto it = buffer_pool_.lower_bound(size);
-    // [kestrel-rs B-3β] loosen reuse matching: 2x → 4x size cap, 2 → 16 page
+    // [lumen-rs B-3β] loosen reuse matching: 2x → 4x size cap, 2 → 16 page
     // additive (=256 KB on 16 KB pages). Original strict matching causes
     // large-buffer cache miss on minor size mismatches (e.g., +33 KB over
     // a 1 MB request), which forces fresh device allocation. Loosening
@@ -62,7 +62,7 @@ class BufferCache {
   }
 
   int release_cached_buffers(size_t min_bytes_to_free) {
-    // [kestrel-rs B-3α] raise bulk-clear threshold 0.9 → 1.0 to avoid
+    // [lumen-rs B-3α] raise bulk-clear threshold 0.9 → 1.0 to avoid
     // catastrophic pool wipe on partial pressure; falls through to
     // iterative LRU tail eviction.
     if (min_bytes_to_free >= pool_size_) {

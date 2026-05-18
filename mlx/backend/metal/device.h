@@ -3,6 +3,7 @@
 #pragma once
 
 #include <Metal/Metal.hpp>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
@@ -199,6 +200,44 @@ class MLX_API Device {
     return residency_sets_;
   }
 
+  // lumen-rs Phase 1.5 deep-dive: kernel cache hit/miss counters.
+  // Atomic so concurrent get_kernel calls don't lose counts. Reset_*
+  // returns the prior values atomically.
+  uint64_t kernel_cache_hits() const {
+    return kernel_cache_hits_.load(std::memory_order_relaxed);
+  }
+  uint64_t kernel_cache_misses() const {
+    return kernel_cache_misses_.load(std::memory_order_relaxed);
+  }
+  void reset_kernel_cache_stats() {
+    kernel_cache_hits_.store(0, std::memory_order_relaxed);
+    kernel_cache_misses_.store(0, std::memory_order_relaxed);
+  }
+
+  // lumen-rs Phase 1.5 Step C: command buffer batching stats.
+  // `commits` counts MTL::CommandBuffer::commit() calls (one per
+  // logical batch). `ops_total` accumulates `stream.buffer_ops` (count
+  // of ops encoded into the buffer) across all commits. Average ops
+  // per cmd buffer = ops_total / commits. Lower commits per decode
+  // step + higher ops-per-buffer = better batching.
+  uint64_t cmd_buffer_commits() const {
+    return cmd_buffer_commits_.load(std::memory_order_relaxed);
+  }
+  uint64_t cmd_buffer_ops_total() const {
+    return cmd_buffer_ops_total_.load(std::memory_order_relaxed);
+  }
+  void reset_cmd_buffer_stats() {
+    cmd_buffer_commits_.store(0, std::memory_order_relaxed);
+    cmd_buffer_ops_total_.store(0, std::memory_order_relaxed);
+  }
+  // Called by CommandEncoder::commit() with the ops encoded into the buffer
+  // it is about to commit (upstream moved command buffers into the encoder).
+  void note_cmd_buffer_commit(int ops) {
+    cmd_buffer_commits_.fetch_add(1, std::memory_order_relaxed);
+    cmd_buffer_ops_total_.fetch_add(
+        static_cast<uint64_t>(ops), std::memory_order_relaxed);
+  }
+
  private:
   NS::SharedPtr<MTL::Library> build_library_(
       const std::string& source_string,
@@ -246,6 +285,17 @@ class MLX_API Device {
   int arch_gen_;
   int max_ops_per_buffer_;
   int max_mb_per_buffer_;
+
+  // lumen-rs Phase 1.5: track kernel-cache lookup hits / misses so the
+  // 2.2× decode gap vs mlx-lm can be tested against the "shape-specialized
+  // kernel cache miss" hypothesis. Incremented in get_kernel() on cache hit
+  // and in get_kernel_() (compile path) on miss.
+  std::atomic<uint64_t> kernel_cache_hits_{0};
+  std::atomic<uint64_t> kernel_cache_misses_{0};
+
+  // lumen-rs Phase 1.5 Step C: command buffer batching counters.
+  std::atomic<uint64_t> cmd_buffer_commits_{0};
+  std::atomic<uint64_t> cmd_buffer_ops_total_{0};
 };
 
 MLX_API Device& device(mlx::core::Device);

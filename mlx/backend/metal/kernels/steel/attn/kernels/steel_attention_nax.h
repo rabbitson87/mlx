@@ -17,6 +17,12 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool has_window [[function_constant(303)]];
+
+// NAX variant doesn't currently allocate Q/KV smem with explicit padding
+// the way the non-NAX path does; BD=512 fits in TGM via different
+// tile-shape choices. Kept here as a documentation comment so the BD=512
+// reasoning is symmetric across both variants.
 
 template <typename T>
 struct TransformScale {
@@ -178,6 +184,7 @@ template <
 
   int kb_lim = params->NK;
   int kb_min_causal = params->NK;
+  int kb_start = 0;
 
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
@@ -189,6 +196,18 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
+  // Sliding-window lower bound — see steel_attention.h for derivation.
+  if (has_window) {
+    int q_min = tid.x * BQ + params->qL_off;
+    int k_min = q_min - params->window_size + 1;
+    if (k_min > 0) {
+      kb_start = k_min / BK;
+      if (kb_start > kb_lim) {
+        kb_start = kb_lim;
+      }
+    }
+  }
+
   const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
   const bool is_last_q = is_last_bq;
@@ -197,7 +216,7 @@ template <
   const short lim_rows_k = params->kL_rem;
 
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -304,6 +323,34 @@ template <
               const auto c = base_col + ik * kU + jj + sn;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
+    }
+
+    // Mask out if outside sliding window (left edge of band).
+    if (has_window && kb < (kb_start + ((BQ + BK - 1) / BK))) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int base_row = tid.x * BQ + params->qL_off + tm;
+      const int base_col = kb * BK;
+
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& fg = Stile.frag_at(iq, ik);
+
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const auto r =
+                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
+              const auto c = base_col + ik * kU + jj + sn;
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              fg[loc] = ((r - c) >= params->window_size) ? neg_inf : fg[loc];
             }
           }
         }

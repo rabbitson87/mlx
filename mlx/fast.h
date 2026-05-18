@@ -60,6 +60,22 @@ MLX_API array scaled_dot_product_attention(
     bool force_fused = false,
     StreamOrDevice s = {});
 
+/** lumen-rs: the same attention with a sliding window. `window_size > 0`
+ * restricts query position q to keys in [q - window_size + 1, q] (combined
+ * with `mask_mode = "causal"`); the steel kernel skips K blocks outside the
+ * band. 0 is plain attention. A separate overload so upstream's
+ * `force_fused` signature stays as it is. */
+MLX_API array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    int window_size,
+    StreamOrDevice s = {});
+
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,
     const array& keys,

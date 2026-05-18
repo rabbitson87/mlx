@@ -1551,3 +1551,40 @@ void init_transforms(nb::module_& m) {
         mx::detail::compile_clear_cache(cache);
       }));
 }
+
+// lumen-rs Phase 1.6 — extern "C" wrappers exposed from the Python core
+// module (core.cpython-*.so). The nanobind LTO link strips unreferenced
+// symbols, so file-scope extern "C" in mlx/transforms.cpp doesn't make it
+// to the final wheel. Defining them HERE (inside the python binding TU)
+// guarantees they survive. ctypes / dlsym from mlx_runner.py finds them
+// via `ctypes.CDLL(mlx.core.__file__)`.
+#include "mlx/scheduler.h"
+
+extern "C" __attribute__((visibility("default"), used)) uint64_t
+mlx_eval_gpu_calls_get(void) {
+  return mlx::core::scheduler::g_eval_gpu_calls.load(
+      std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) uint64_t
+mlx_eval_gpu_ns_get(void) {
+  return mlx::core::scheduler::g_eval_gpu_ns.load(
+      std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) void
+mlx_eval_gpu_stats_reset(void) {
+  mlx::core::scheduler::g_eval_gpu_calls.store(
+      0, std::memory_order_relaxed);
+  mlx::core::scheduler::g_eval_gpu_ns.store(0, std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
+mlx_prim_hist_dyn_dump_buf(char* buf, int buf_size) {
+  return mlx::core::scheduler::prim_hist_dyn_dump(buf, buf_size);
+}
+
+extern "C" __attribute__((visibility("default"), used)) void
+mlx_prim_hist_dyn_reset_buf(void) {
+  mlx::core::scheduler::prim_hist_dyn_reset();
+}
