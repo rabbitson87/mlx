@@ -17,6 +17,12 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool has_window [[function_constant(303)]];
+
+// NAX variant doesn't currently allocate Q/KV smem with explicit padding
+// the way the non-NAX path does; BD=512 fits in TGM via different
+// tile-shape choices. Kept here as a documentation comment so the BD=512
+// reasoning is symmetric across both variants.
 
 template <typename T>
 struct TransformScale {
@@ -176,11 +182,24 @@ template <
   }
 
   int kb_lim = params->NK;
+  int kb_start = 0;
 
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
     kb_lim = (q_max + BK - 1) / BK;
     kb_lim = min(params->NK, kb_lim);
+  }
+
+  // Sliding-window lower bound — see steel_attention.h for derivation.
+  if (has_window) {
+    int q_min = tid.x * BQ + params->qL_off;
+    int k_min = q_min - params->window_size + 1;
+    if (k_min > 0) {
+      kb_start = k_min / BK;
+      if (kb_start > kb_lim) {
+        kb_start = kb_lim;
+      }
+    }
   }
 
   const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
@@ -191,7 +210,7 @@ template <
   const short lim_rows_k = params->kL_rem - sm;
 
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -324,6 +343,36 @@ template <
               const auto c = col_pos + jj + sn;
               const auto loc = ii * PSubTile::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
+    }
+
+    // Mask out if outside sliding window (left edge of band).
+    if (has_window && kb < (kb_start + ((BQ + BK - 1) / BK))) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int base_row = tid.x * BQ + params->qL_off + tm;
+      const int base_col = kb * BK;
+
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          const short row_pos = base_row + iq * UQ;
+          const short col_pos = base_col + ik * UK;
+
+          thread auto& fg = Ptile.subtile_at(iq, ik).frag_at(0, 0);
+
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < PSubTile::kFragThrRows; ii++) {
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < PSubTile::kFragThrCols; jj++) {
+              const auto r = row_pos + ii * PSubTile::kFragRowsJump + sm;
+              const auto c = col_pos + jj + sn;
+              const auto loc = ii * PSubTile::kFragThrCols + jj;
+              fg[loc] = ((r - c) >= params->window_size) ? neg_inf : fg[loc];
             }
           }
         }

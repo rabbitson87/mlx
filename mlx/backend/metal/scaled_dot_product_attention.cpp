@@ -24,6 +24,7 @@ void sdpa_full_self_attention_nax(
     const float scale,
     array& o,
     bool do_causal_,
+    int window_size_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
   using namespace mlx::steel;
@@ -48,13 +49,15 @@ void sdpa_full_self_attention_nax(
   const bool has_mask = mask.has_value();
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
+  const bool has_window = window_size_ > 0;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&has_window, MTL::DataType::DataTypeBool, 303}};
 
   std::string base_name;
   concatenate(
@@ -87,7 +90,9 @@ void sdpa_full_self_attention_nax(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-      (has_sinks ? 't' : 'n'));
+      (has_sinks ? 't' : 'n'),
+      "_has_window_",
+      (has_window ? 't' : 'n'));
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
@@ -133,6 +138,8 @@ void sdpa_full_self_attention_nax(
       /* int kL_rem = */ (kL - NK_aligned * bk),
       /* int qL_off = */ (kL - qL),
 
+      /* int window_size = */ window_size_,
+
       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
@@ -172,6 +179,7 @@ void sdpa_full_self_attention_metal(
     const float scale,
     array& o,
     bool do_causal_,
+    int window_size_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
   if (metal::is_nax_available() && q.shape(3) != 80 &&
@@ -185,6 +193,7 @@ void sdpa_full_self_attention_metal(
         /* const float scale = */ scale,
         /* array& o = */ o,
         /* bool do_causal_ = */ do_causal_,
+        /* int window_size_ = */ window_size_,
         /* const std::optional<array>& mask = */ mask,
         /* const std::optional<array>& sinks = */ sinks);
   }
@@ -211,13 +220,15 @@ void sdpa_full_self_attention_metal(
   const bool has_mask = mask.has_value();
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
+  const bool has_window = window_size_ > 0;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&has_window, MTL::DataType::DataTypeBool, 303}};
 
   std::string base_name;
   concatenate(
@@ -250,7 +261,9 @@ void sdpa_full_self_attention_metal(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-      (has_sinks ? 't' : 'n'));
+      (has_sinks ? 't' : 'n'),
+      "_has_window_",
+      (has_window ? 't' : 'n'));
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
@@ -295,6 +308,8 @@ void sdpa_full_self_attention_metal(
       /* int qL_rem = */ (qL - NQ_aligned * bq),
       /* int kL_rem = */ (kL - NK_aligned * bk),
       /* int qL_off = */ (kL - qL),
+
+      /* int window_size = */ window_size_,
 
       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
@@ -594,6 +609,7 @@ bool ScaledDotProductAttention::use_fallback(
     bool do_causal,
     bool is_training,
     bool output_logsumexp,
+    int window_size,
     Stream s) {
   if (is_training) {
     // It's faster for training on Metal to use the unfused SDPA for both
@@ -615,12 +631,53 @@ bool ScaledDotProductAttention::use_fallback(
   const int num_kv_heads = k.shape(1);
   const int gqa_factor = num_query_heads / num_kv_heads;
 
+  // lumen-rs 2026-05-16 — D=512 instantiation was added to
+  // scaled_dot_product_attention.metal but NOT enabled in the supported-head-dim
+  // guard. A/B at Gemma 4 26B-A4B (D=512 full-attn decode, M3 Max):
+  //   - matmul fallback (softmax(Q@K^T)+V): 79 tok/s at ctx=128
+  //   - sdpa_vector D=512:                  27 tok/s at ctx=128 (-66%)
+  // Cause: qk_per_thread = D/BD = 16 at D=512 inflates per-thread register
+  // pressure (q[16] + k[16] + o[16] = 192 B/thread before temps/counters),
+  // pushing close to the Apple Silicon ~256 B per-thread budget and likely
+  // spilling to threadgroup memory or DRAM. The matmul fallback's tuned gemm
+  // kernels handle D=512 better at decode-time Q-row=1 workloads.
+  // Kept the kernel instantiation in the .metal file so a future attempt
+  // (e.g. larger BD value, or split-D variant) can be enabled via the env
+  // gate `LUMEN_SDPA_VECTOR_D512=1`.
+  static const bool enable_sdpa_vector_d512 = []() {
+    const char* v = std::getenv("LUMEN_SDPA_VECTOR_D512");
+    return v && std::string(v) == "1";
+  }();
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 256);
+       query_head_dim == 256 ||
+       (query_head_dim == 512 && enable_sdpa_vector_d512));
+  // lumen-rs 2026-05-15 — head_dim=256 added to instantiations
+  // (steel_attention.metal / nax) but NOT enabled in the supported-head-dim
+  // guard. Reason: on macOS < 26.2 (no NAX), the non-nax steel kernel uses
+  // 8×8 simdgroup_matrix fragments and lacks sliding-window early
+  // termination — for Gemma 4 sliding layers (window=1024 << Skv=8192) the
+  // matmul+softmax+matmul fallback is empirically faster (8K A/B: fallback
+  // 572 tok/s vs steel-BD256 522 tok/s, sliding attn 5891 ms vs 9505 ms).
+  // When LUMEN_GEMMA4_PREFILL_FAST_BD256=1 is set, the BD=256 fast path is
+  // enabled (useful on macOS 26.2+ with NAX where the UD=32 fragments
+  // should win, AND for models with full-attention BD=256 + do_causal).
+  static const bool enable_bd256 = []() {
+    const char* v = std::getenv("LUMEN_GEMMA4_PREFILL_FAST_BD256");
+    return v && std::string(v) == "1";
+  }();
+  // BD=256 acceptance:
+  //   - opt-in env gate `LUMEN_GEMMA4_PREFILL_FAST_BD256=1`, OR
+  //   - sliding-window mode active (window_size > 0) — the kernel's
+  //     window-aware kb_start truncation is the entire purpose of taking
+  //     this path; the regression vs matmul fallback observed on non-NAX
+  //     systems for full-causal BD=256 doesn't apply since most K blocks
+  //     are skipped wholesale.
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 80 ||
+       query_head_dim == 128 ||
+       (query_head_dim == 256 && (enable_bd256 || window_size > 0)));
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);
@@ -775,7 +832,7 @@ void ScaledDotProductAttention::eval_gpu(
         : std::nullopt;
 
     sdpa_full_self_attention_metal(
-        s, d, q, k, v, scale_, o, do_causal_, mask, sinks);
+        s, d, q, k, v, scale_, o, do_causal_, window_size_, mask, sinks);
   }
 
   d.add_temporaries(std::move(copies), s.index);

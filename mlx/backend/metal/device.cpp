@@ -402,6 +402,12 @@ MTL::CommandBuffer* Device::get_command_buffer(int index) {
 
 void Device::commit_command_buffer(int index) {
   auto& stream = get_stream_(index);
+  // lumen-rs Phase 1.5 Step C: record per-buffer op count BEFORE
+  // commit() resets buffer_ops to 0. Lets us measure "ops per command
+  // buffer" — a proxy for batching quality (higher = better batching).
+  cmd_buffer_commits_.fetch_add(1, std::memory_order_relaxed);
+  cmd_buffer_ops_total_.fetch_add(
+      static_cast<uint64_t>(stream.buffer_ops), std::memory_order_relaxed);
   stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;
@@ -770,9 +776,12 @@ MTL::ComputePipelineState* Device::get_kernel(
     // Look for cached kernel
     auto& kernel_map_ = library_kernels_[mtl_lib];
     if (auto it = kernel_map_.find(kname); it != kernel_map_.end()) {
+      kernel_cache_hits_.fetch_add(1, std::memory_order_relaxed);
       return it->second;
     }
   }
+  // Cache miss — compile path (expensive, ~ms per new shape specialization).
+  kernel_cache_misses_.fetch_add(1, std::memory_order_relaxed);
   return get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
 }
 

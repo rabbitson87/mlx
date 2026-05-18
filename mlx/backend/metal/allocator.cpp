@@ -50,7 +50,7 @@ MetalAllocator::MetalAllocator()
       std::get<size_t>(info.at("max_recommended_working_set_size"));
   resource_limit_ = std::get<size_t>(info.at("resource_limit"));
   block_limit_ = std::min(1.5 * max_rec_size, 0.95 * memsize);
-  // [kestrel-rs B-3γ] raise gc_limit_ multiplier 0.95 → 0.98 to reduce
+  // [lumen-rs B-3γ] raise gc_limit_ multiplier 0.95 → 0.98 to reduce
   // release_cached_buffers call frequency. The narrower headroom (2% vs 5%)
   // means fewer cache evictions per dispatch — buffer reuse rate increases,
   // MetalAllocator::malloc cold-path hits drop. Risk: less reserve before
@@ -89,7 +89,7 @@ size_t MetalAllocator::set_cache_limit(size_t limit) {
 size_t MetalAllocator::set_memory_limit(size_t limit) {
   std::unique_lock lk(mutex_);
   std::swap(limit, block_limit_);
-  // [kestrel-rs B-3γ] keep set_memory_limit gc_limit_ in sync with constructor
+  // [lumen-rs B-3γ] keep set_memory_limit gc_limit_ in sync with constructor
   gc_limit_ = std::min(
       block_limit_,
       static_cast<size_t>(0.98 * device_->recommendedMaxWorkingSetSize()));

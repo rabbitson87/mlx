@@ -14,6 +14,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool has_window [[function_constant(303)]];
 
 template <typename T>
 struct TransformScale {
@@ -245,6 +246,7 @@ template <
   }
 
   int kb_lim = params->NK;
+  int kb_start = 0;
 
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
@@ -252,8 +254,26 @@ template <
     kb_lim = min(params->NK, kb_lim);
   }
 
+  // Sliding-window lower bound: each query at q_abs only attends to keys
+  // in [max(0, q_abs - W + 1), q_abs]. Within a Q tile the smallest
+  // q_abs is q_min = tid.x * BQ + qL_off; the smallest valid K position
+  // is then q_min - W + 1 (or 0 if negative). Truncate kb_start to the
+  // K block containing that K position so we skip all-masked-out blocks
+  // entirely. Per-element left-edge masking inside the loop handles
+  // partial blocks near kb_start.
+  if (has_window) {
+    int q_min = tid.x * BQ + params->qL_off;
+    int k_min = q_min - params->window_size + 1;
+    if (k_min > 0) {
+      kb_start = k_min / BK; // floor: include the block containing k_min
+      if (kb_start > kb_lim) {
+        kb_start = kb_lim;
+      }
+    }
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!align_K && kb == (params->NK_aligned)) {
@@ -318,6 +338,31 @@ template <
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
             if (row_pos < (col_pos + jj)) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
+          }
+        }
+      }
+    }
+
+    // Mask out if outside sliding window (left edge of band).
+    // Only the first ceil(BQ / BK) blocks past kb_start can have any
+    // cells whose absolute K position is below row_pos - W + 1.
+    if (has_window && kb < (kb_start + ((BQ + BK - 1) / BK))) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos =
+            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            if (row_pos - (col_pos + jj) >= params->window_size) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }

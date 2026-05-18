@@ -8,7 +8,80 @@
 #include "mlx/transforms.h"
 #include "mlx/transforms_impl.h"
 
+// lumen-rs Phase 1.6: SDPA stage-timing instrumentation.
+// Accumulates per-stage wall-clock time inside
+// `scaled_dot_product_attention()`. Dump to stderr via `atexit` when
+// `LUMEN_SDPA_TIMING_DUMP=1` is set. Used to localize the 0.64 ms/call
+// CPU cost we see at 4K context (vs ~1 μs at short context) inside
+// MLX C++ rather than mlx-c / mlx-rs FFI layers.
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace mlx::core::fast {
+
+namespace sdpa_timing {
+  // All counters are atomic-relaxed; cost on the hot path is ~5 ns/stage
+  // (relaxed fetch_add) and we time 6 stages → ~30 ns overhead per SDPA
+  // call. Negligible vs the 1.7 ms call cost we're investigating.
+  static std::atomic<uint64_t> g_calls{0};
+  static std::atomic<uint64_t> g_validation_ns{0};
+  static std::atomic<uint64_t> g_astype_ns{0};
+  static std::atomic<uint64_t> g_input_prep_ns{0};
+  static std::atomic<uint64_t> g_use_fallback_check_ns{0};
+  static std::atomic<uint64_t> g_primitive_construct_ns{0};
+  static std::atomic<uint64_t> g_fallback_path_ns{0};
+  static std::atomic<uint64_t> g_total_ns{0};
+
+  // Dump every N calls when LUMEN_SDPA_TIMING_DUMP=1 is set. Static
+  // libraries can elide namespace-scope static initializers (atexit
+  // registration via `static int x = register()` was observed to no-op
+  // when libmlx.a is linked into the bench binary), so we trigger the
+  // dump from a known-live call site instead.
+  static constexpr uint64_t kDumpEveryNCalls = 500;
+
+  static void dump_now() {
+    uint64_t calls = g_calls.load();
+    if (calls == 0) {
+      std::fprintf(stderr, "[mlx-sdpa-timing] no SDPA calls observed\n");
+      return;
+    }
+    auto fmt = [&](const char* name, std::atomic<uint64_t>& bucket) {
+      double total_ms = bucket.load() / 1e6;
+      double per_call_us = bucket.load() / 1000.0 / static_cast<double>(calls);
+      std::fprintf(
+          stderr,
+          "[mlx-sdpa-timing] %-22s %10.3f ms total   %10.3f us/call\n",
+          name, total_ms, per_call_us);
+    };
+    std::fprintf(
+        stderr, "[mlx-sdpa-timing] === SDPA stage breakdown (calls=%llu) ===\n",
+        static_cast<unsigned long long>(calls));
+    fmt("validation", g_validation_ns);
+    fmt("astype",     g_astype_ns);
+    fmt("input_prep", g_input_prep_ns);
+    fmt("fallback_check", g_use_fallback_check_ns);
+    fmt("primitive_ctor", g_primitive_construct_ns);
+    fmt("fallback_path", g_fallback_path_ns);
+    fmt("TOTAL", g_total_ns);
+  }
+
+  static bool dump_enabled() {
+    // Cached on first call (avoids getenv on hot path).
+    static bool b = (std::getenv("LUMEN_SDPA_TIMING_DUMP") != nullptr);
+    return b;
+  }
+
+  static void maybe_dump() {
+    if (!dump_enabled()) return;
+    uint64_t calls = g_calls.load();
+    if (calls > 0 && calls % kDumpEveryNCalls == 0) {
+      dump_now();
+    }
+  }
+} // namespace sdpa_timing
+
 
 std::vector<array> Custom::vjp(
     const std::vector<array>& primals,
@@ -601,7 +674,31 @@ array scaled_dot_product_attention(
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
+    int window_size /* = 0 */,
     StreamOrDevice s /* = {}*/) {
+  using clock_t = std::chrono::steady_clock;
+  auto t_start = clock_t::now();
+  auto t_last = t_start;
+  auto stage = [&t_last](std::atomic<uint64_t>& bucket) {
+    auto now = clock_t::now();
+    bucket.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_last)
+            .count(),
+        std::memory_order_relaxed);
+    t_last = now;
+  };
+  // One-shot sentinel — UNCONDITIONAL stderr print on the first SDPA
+  // call. If this doesn't appear in test output, the linker is
+  // dead-stripping the instrumentation entirely (likely cause: hidden
+  // visibility + static-lib + macOS `-dead_strip`).
+  {
+    static std::atomic<bool> first_call{true};
+    bool expected = true;
+    if (first_call.compare_exchange_strong(expected, false)) {
+      std::fprintf(stderr, "[mlx-sdpa-timing] FIRST SDPA CALL — instrumented build is live\n");
+    }
+  }
+
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -684,6 +781,8 @@ array scaled_dot_product_attention(
     throw std::invalid_argument(msg.str());
   }
 
+  stage(sdpa_timing::g_validation_ns);
+
   auto final_type = result_type(queries, keys, values);
   if (!issubdtype(final_type, floating)) {
     std::ostringstream msg;
@@ -696,11 +795,13 @@ array scaled_dot_product_attention(
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
   auto v = astype(values, final_type, s);
+  stage(sdpa_timing::g_astype_ns);
 
   auto fallback = [scale,
                    n_q_heads,
                    n_kv_heads,
                    do_causal,
+                   window_size,
                    has_sinks,
                    has_arr_mask,
                    s](const std::vector<array>& inputs) {
@@ -725,7 +826,16 @@ array scaled_dot_product_attention(
           auto k_idx = arange(0, kL, s);
           q_idx = expand_dims(q_idx, 1, s);
           k_idx = expand_dims(k_idx, 0, s);
-          return greater_equal(q_idx, k_idx, s);
+          auto causal_mask = greater_equal(q_idx, k_idx, s);
+          if (window_size > 0) {
+            // Sliding-window: q_idx < k_idx + window_size, combined with
+            // causal (q_idx >= k_idx). Produces the diagonal band of
+            // attention.
+            auto upper = less(
+                q_idx, add(k_idx, array(window_size, k_idx.dtype()), s), s);
+            return logical_and(causal_mask, upper, s);
+          }
+          return causal_mask;
         }
         return inputs[3];
       };
@@ -771,6 +881,9 @@ array scaled_dot_product_attention(
     return std::vector<array>{out};
   };
 
+  // Lambda capture itself is cheap; the lambda body only runs on the
+  // fallback path so its construction cost is just the std::function
+  // alloc. Bucket into input_prep along with the array-construction work.
   auto stream = to_stream(s);
   std::vector<array> inputs = {q, k, v};
   if (has_arr_mask) {
@@ -804,20 +917,25 @@ array scaled_dot_product_attention(
     }
     inputs.push_back(astype(*sinks, final_type, stream));
   }
+  stage(sdpa_timing::g_input_prep_ns);
 
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
   bool output_logsumexp = is_training && has_fast_vjp;
-  if (!ScaledDotProductAttention::use_fallback(
-          q,
-          k,
-          v,
-          has_mask,
-          has_arr_mask,
-          do_causal,
-          is_training,
-          output_logsumexp,
-          stream)) {
+  bool needs_fallback = ScaledDotProductAttention::use_fallback(
+      q,
+      k,
+      v,
+      has_mask,
+      has_arr_mask,
+      do_causal,
+      is_training,
+      output_logsumexp,
+      window_size,
+      stream);
+  stage(sdpa_timing::g_use_fallback_check_ns);
+
+  if (!needs_fallback) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
@@ -829,19 +947,37 @@ array scaled_dot_product_attention(
     }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
-        stream, fallback, scale, do_causal, has_sinks, output_logsumexp);
-    if (output_logsumexp) {
-      return array::make_arrays(
-          {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
-          {final_type, float32},
-          primitive,
-          std::move(inputs))[0];
-    } else {
-      return array(
-          std::move(out_shape), final_type, primitive, std::move(inputs));
-    }
+        stream, fallback, scale, do_causal, has_sinks, output_logsumexp,
+        window_size);
+    array result = output_logsumexp
+        ? array::make_arrays(
+              {std::move(out_shape),
+               Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
+              {final_type, float32},
+              primitive,
+              std::move(inputs))[0]
+        : array(
+              std::move(out_shape), final_type, primitive, std::move(inputs));
+    stage(sdpa_timing::g_primitive_construct_ns);
+    sdpa_timing::g_total_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock_t::now() - t_start)
+            .count(),
+        std::memory_order_relaxed);
+    sdpa_timing::g_calls.fetch_add(1, std::memory_order_relaxed);
+    sdpa_timing::maybe_dump();
+    return result;
   }
-  return fallback(std::move(inputs))[0];
+  array fb = fallback(std::move(inputs))[0];
+  stage(sdpa_timing::g_fallback_path_ns);
+  sdpa_timing::g_total_ns.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          clock_t::now() - t_start)
+          .count(),
+      std::memory_order_relaxed);
+  sdpa_timing::g_calls.fetch_add(1, std::memory_order_relaxed);
+  sdpa_timing::maybe_dump();
+  return fb;
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(
@@ -895,7 +1031,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
       static_cast<const ScaledDotProductAttention&>(other);
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
-      output_logsumexp_ == a_other.output_logsumexp_;
+      output_logsumexp_ == a_other.output_logsumexp_ &&
+      window_size_ == a_other.window_size_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
@@ -939,3 +1076,58 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
 }
 
 } // namespace mlx::core::fast
+
+// lumen-rs Phase 1.6: extern "C" public dump entry point.
+//
+// MUST be at file scope (not inside a namespace) and `extern "C"` so it
+// has external linkage with default visibility. This prevents macOS ld
+// from dead-stripping the SDPA stage-timing instrumentation chain in
+// libmlx.a — the namespace-scope static helpers (`dump_now`,
+// `maybe_dump`, `dump_enabled`) had no externally-visible reference
+// after the linker dead-strip pass and were eliminated, removing all
+// timing strings from the final binary.
+//
+// Called from lumen-rs's bench at end-of-run via a Rust `extern "C"`
+// declaration. The function is no-op when no SDPA calls have happened
+// or when the counters are all zero.
+extern "C" __attribute__((visibility("default"))) void
+mlx_dump_sdpa_timing(void) {
+  using namespace mlx::core::fast::sdpa_timing;
+  uint64_t calls = g_calls.load();
+  if (calls == 0) {
+    std::fprintf(stderr, "[mlx-sdpa-timing] no SDPA calls observed\n");
+    return;
+  }
+  auto fmt = [calls](const char* name, std::atomic<uint64_t>& bucket) {
+    double total_ms = bucket.load() / 1e6;
+    double per_call_us = bucket.load() / 1000.0 / static_cast<double>(calls);
+    std::fprintf(
+        stderr,
+        "[mlx-sdpa-timing] %-22s %10.3f ms total   %10.3f us/call\n",
+        name, total_ms, per_call_us);
+  };
+  std::fprintf(
+      stderr, "[mlx-sdpa-timing] === SDPA stage breakdown (calls=%llu) ===\n",
+      static_cast<unsigned long long>(calls));
+  fmt("validation", g_validation_ns);
+  fmt("astype", g_astype_ns);
+  fmt("input_prep", g_input_prep_ns);
+  fmt("fallback_check", g_use_fallback_check_ns);
+  fmt("primitive_ctor", g_primitive_construct_ns);
+  fmt("fallback_path", g_fallback_path_ns);
+  fmt("TOTAL", g_total_ns);
+}
+
+// Reset counters between bench runs (warmup vs timed).
+extern "C" __attribute__((visibility("default"))) void
+mlx_reset_sdpa_timing(void) {
+  using namespace mlx::core::fast::sdpa_timing;
+  g_calls.store(0);
+  g_validation_ns.store(0);
+  g_astype_ns.store(0);
+  g_input_prep_ns.store(0);
+  g_use_fallback_check_ns.store(0);
+  g_primitive_construct_ns.store(0);
+  g_fallback_path_ns.store(0);
+  g_total_ns.store(0);
+}

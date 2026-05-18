@@ -249,9 +249,9 @@ void qmv(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = 8;
+  int bn = 8;  // revert lever #3
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size group_dims(bk, 2, 1);  // revert lever #3
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   std::string kname;
@@ -880,9 +880,9 @@ void gather_qmv(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = 8;
+  int bn = 8;  // revert lever #3
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size group_dims(bk, 2, 1);  // revert lever #3
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   std::string kname;
