@@ -284,13 +284,16 @@ kernel void lumen_tq_rot_encode_fused(
 // Grid:    (ceil(N / 8), T, B · H)
 // TG-size: (num_simdgroups · SIMD_SIZE = 64, 1, 1)
 //
-// First-iteration constraints (enforced at factory):
-//   - D == 256  (Gemma 4 head_dim; later iterations can template on D)
+// Constraints (enforced at factory):
+//   - D == TQ_QK_VPT · SIMD_SIZE (i.e. D % 32 == 0; VPT is a function-constant
+//     specialization parameter — VPT=8 for D=256 (sliding head_dim), VPT=16
+//     for D=512 (Gemma 4 full-attn global_head_dim))
 //   - n_levels ≤ 16 (bits ≤ 4)
 
 constant uint TQ_QK_NSG        = 2;    // simdgroups per TG
 constant uint TQ_QK_RPS        = 4;    // N-rows per simdgroup
-constant uint TQ_QK_VPT        = 8;    // D-elements per thread
+constant uint TQ_QK_VPT        = 8;    // D-elements per thread (D=256 variant)
+constant uint TQ_QK_VPT_D512   = 16;   // D-elements per thread (D=512 variant)
 constant uint TQ_QK_ROWS_PER_TG = TQ_QK_NSG * TQ_QK_RPS;  // = 8
 constant uint TQ_QK_MAX_NCENTROIDS = 16;  // bits ≤ 4
 
@@ -358,6 +361,93 @@ kernel void lumen_tq_qk_inline(
 
     // simd_sum across the 32 threads in this simdgroup → one result per
     // (simdgroup, row). Apply per-K-vector σ and store as bf16.
+    const uint sigma_base  = (b * H_kv + h_kv) * N;
+    const uint scores_base = ((b * H + h) * T + t) * N;
+
+    for (uint row = 0; row < TQ_QK_RPS; row++) {
+        uint n = n_base + row;
+        float sum = simd_sum(result[row]);
+        if (simd_lid == 0 && n < N) {
+            float sigma_val = K_sigma[sigma_base + n];
+            scores[scores_base + n] = bfloat(sum * sigma_val);
+        }
+    }
+}
+
+// ── TurboQuant Stage-1 qk inline matmul (D=512 variant) ───────────────────
+//
+// Same kernel as `lumen_tq_qk_inline` but with VPT=16 instead of VPT=8 so
+// 32·16 = 512 D-elements per simdgroup → handles Gemma 4 full-attention
+// global_head_dim=512. Source duplicated rather than templated because
+// Metal function constants cannot be used as array sizes (compile error),
+// and a max-sized scratch array of 16 floats wastes 32 B/thread for the
+// D=256 case — small but real on the dispatch-bound decode path.
+//
+// Shape/contract identical to lumen_tq_qk_inline. Constraints:
+//   - D == 512 (kernel hardcodes VPT=16)
+//   - n_levels ≤ 16 (bits ≤ 4)
+//   - H % H_kv == 0 (GQA)
+
+kernel void lumen_tq_qk_inline_d512(
+    device const bfloat* __restrict__ Q         [[buffer(0)]],
+    device const uchar*  __restrict__ K_codes   [[buffer(1)]],
+    device const float*  __restrict__ K_sigma   [[buffer(2)]],
+    device const float*  __restrict__ centroids [[buffer(3)]],
+    device       bfloat*              scores    [[buffer(4)]],
+    constant uint& B    [[buffer(5)]],
+    constant uint& H    [[buffer(6)]],
+    constant uint& H_kv [[buffer(7)]],
+    constant uint& T    [[buffer(8)]],
+    constant uint& N    [[buffer(9)]],
+    constant uint& D    [[buffer(10)]],
+    constant uint& n_levels [[buffer(11)]],
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]
+) {
+    threadgroup float centroids_tg[TQ_QK_MAX_NCENTROIDS];
+
+    // Decode grid index.
+    const uint nb = tid.x;
+    const uint t  = tid.y;
+    const uint bh = tid.z;
+    const uint b  = bh / H;
+    const uint h  = bh % H;
+    const uint h_kv = h * H_kv / H;
+
+    const uint n_base = nb * TQ_QK_ROWS_PER_TG + simd_gid * TQ_QK_RPS;
+
+    if (simd_gid == 0 && simd_lid < n_levels) {
+        centroids_tg[simd_lid] = centroids[simd_lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // VPT=16 D-elements per thread → 32 threads × 16 = 512 = D.
+    float x_thread[TQ_QK_VPT_D512];
+    const uint q_base = ((b * H + h) * T + t) * D + simd_lid * TQ_QK_VPT_D512;
+    for (uint v = 0; v < TQ_QK_VPT_D512; v++) {
+        x_thread[v] = float(Q[q_base + v]);
+    }
+
+    float result[TQ_QK_RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint K_block_base = (b * H_kv + h_kv) * N * D;
+
+    for (uint row = 0; row < TQ_QK_RPS; row++) {
+        uint n = n_base + row;
+        if (n >= N) {
+            continue;
+        }
+        const device uchar* K_row =
+            K_codes + K_block_base + n * D + simd_lid * TQ_QK_VPT_D512;
+        float partial = 0.0f;
+        for (uint v = 0; v < TQ_QK_VPT_D512; v++) {
+            uchar code = K_row[v];
+            partial = fma(x_thread[v], centroids_tg[code], partial);
+        }
+        result[row] = partial;
+    }
+
     const uint sigma_base  = (b * H_kv + h_kv) * N;
     const uint scores_base = ((b * H + h) * T + t) * N;
 
@@ -941,15 +1031,6 @@ void TurboquantQkInline::eval_gpu(
   auto lib = d.get_library(tq_lib_name(), []() {
     return std::string(TQ_SHADER_SRC);
   });
-  auto kernel = d.get_kernel("lumen_tq_qk_inline", lib);
-
-  auto& enc = metal::get_command_encoder(s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_input_array(q, 0);
-  enc.set_input_array(k_codes, 1);
-  enc.set_input_array(k_sigma, 2);
-  enc.set_input_array(centroids, 3);
-  enc.set_output_array(scores, 4);
 
   uint32_t B    = static_cast<uint32_t>(q.shape(0));
   uint32_t H    = static_cast<uint32_t>(q.shape(1));
@@ -958,6 +1039,31 @@ void TurboquantQkInline::eval_gpu(
   uint32_t H_kv = static_cast<uint32_t>(k_codes.shape(1));
   uint32_t N    = static_cast<uint32_t>(k_codes.shape(2));
   uint32_t n_levels = static_cast<uint32_t>(centroids.size());
+
+  // Dispatch by D to the matching kernel variant. D=256 hits VPT=8
+  // (sliding-attn head_dim); D=512 hits VPT=16 (full-attn global_head_dim).
+  // Function constants would let us share one source, but Apple's Metal
+  // compiler rejects function-constant array sizes (`float a[FC]`), so we
+  // duplicate the kernel rather than waste 32 B/thread on a max-size array.
+  const char* kernel_name;
+  if (D == 256) {
+    kernel_name = "lumen_tq_qk_inline";
+  } else if (D == 512) {
+    kernel_name = "lumen_tq_qk_inline_d512";
+  } else {
+    throw std::invalid_argument(
+        "lumen::TurboquantQkInline: only D ∈ {256, 512} supported; got D=" +
+        std::to_string(D));
+  }
+  auto kernel = d.get_kernel(kernel_name, lib);
+
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(q, 0);
+  enc.set_input_array(k_codes, 1);
+  enc.set_input_array(k_sigma, 2);
+  enc.set_input_array(centroids, 3);
+  enc.set_output_array(scores, 4);
 
   enc.set_bytes(B,        5);
   enc.set_bytes(H,        6);
