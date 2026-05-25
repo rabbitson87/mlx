@@ -346,8 +346,10 @@ std::vector<array> turboquant_rot_encode_fused(
 // Output:
 //   scores    : [B, H,    T, N]   bfloat16
 //
-// Constraints (first iteration):
-//   - D == 256 (Gemma 4 head_dim; the kernel hardcodes values_per_thread=8)
+// Constraints:
+//   - D ∈ {256, 512}  (kernel specialized via VPT function-constant:
+//     VPT=8 for D=256 — sliding-attention head_dim;
+//     VPT=16 for D=512 — Gemma 4 full-attention global_head_dim)
 //   - n_levels ≤ 16 (bits ≤ 4)
 //   - q.shape(0) == k_codes.shape(0)
 //   - q.shape(3) == k_codes.shape(3)
@@ -410,8 +412,11 @@ array turboquant_qk_inline(
 // Output:
 //   o         : [B, H,    T, D]   bfloat16
 //
-// Constraints (first iteration):
-//   - D == 256 (Gemma 4 head_dim; kernel uses one thread per D output)
+// Constraints:
+//   - D must be a multiple of 64 (D_TILE_PER_TG); validated at factory.
+//     Empirically used: D=256 (sliding-attn) and D=512 (full-attn). The
+//     kernel + factory are D-agnostic — grid scales as ceil(D/64) d-tiles
+//     so larger D just dispatches more threadgroups.
 //   - n_levels ≤ 16 (bits ≤ 4)
 //   - s.shape(0) == v_codes.shape(0)
 //   - s.shape(3) == v_codes.shape(2) == N
