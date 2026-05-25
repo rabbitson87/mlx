@@ -393,10 +393,10 @@ array turboquant_qk_inline(
         << " must be a non-zero multiple of H_kv=" << H_kv;
     throw std::invalid_argument(msg.str());
   }
-  if (D != 256) {
+  if (D != 256 && D != 512) {
     std::ostringstream msg;
-    msg << "[lumen::turboquant_qk_inline] D must be 256 (first iteration), got "
-        << D;
+    msg << "[lumen::turboquant_qk_inline] D must be 256 (sliding-attn head_dim) "
+        << "or 512 (full-attn global_head_dim), got " << D;
     throw std::invalid_argument(msg.str());
   }
   int n_levels = centroids.shape(0);
@@ -506,10 +506,13 @@ array turboquant_sv_inline(
         << " must be a non-zero multiple of H_kv=" << H_kv;
     throw std::invalid_argument(msg.str());
   }
-  if (D != 256) {
+  // Kernel + factory are D-agnostic — grid scales as ceil(D/64) d-tiles.
+  // Empirically used: D=256 (sliding-attn) and D=512 (full-attn). Require
+  // D to be a multiple of 64 (D_TILE_PER_TG) so tile alignment holds.
+  if (D == 0 || D % 64 != 0) {
     std::ostringstream msg;
-    msg << "[lumen::turboquant_sv_inline] D must be 256 (first iteration), got "
-        << D;
+    msg << "[lumen::turboquant_sv_inline] D must be a non-zero multiple of 64, "
+        << "got " << D;
     throw std::invalid_argument(msg.str());
   }
   int n_levels = centroids.shape(0);
