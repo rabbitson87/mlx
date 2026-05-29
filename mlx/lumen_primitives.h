@@ -464,6 +464,85 @@ array turboquant_sv_inline(
     StreamOrDevice stream = {});
 
 // ─────────────────────────────────────────────────────────────────────────
+// TurboquantFusedAttn — full attention (QK^T, softmax, AV) fused into one
+// Metal dispatch with inline Lloyd-Max K/V dequant. Replaces the
+// (turboquant_qk_inline + softmax + turboquant_sv_inline) 3-dispatch chain
+// at decode (T=1).
+//
+// Inputs:
+//   q         : [B, H,    T=1, D]   bfloat16   (Q in head_dim space)
+//   k_codes   : [B, H_kv, N,   D]   uint8
+//   k_sigma   : [B, H_kv, N]        float32
+//   v_codes   : [B, H_kv, N,   D]   uint8
+//   v_sigma   : [B, H_kv, N]        float32
+//   centroids : [n_levels]          float32   (Lloyd-Max LUT; n_levels ≤ 16)
+//   scale     : (host-side scalar)  float32   (attention scale = 1/sqrt(D)
+//                                              * any external softcap factor)
+// Output:
+//   o         : [B, H,    T=1, D]   bfloat16
+//
+// Constraints:
+//   - T == 1 (decode shape; prefill handled by mlx fast::sdpa)
+//   - D ∈ {256, 512}  (source-duplicated kernels for sliding/full-attn)
+//   - n_levels ≤ 16  (bits ≤ 4)
+//   - H % H_kv == 0  (GQA)
+//
+// Threading: BN=32 simdgroups × BD=32 threads/SG; online softmax updates
+// register-resident max + sum per N stride; final cross-SG aggregate
+// produces normalized output. See lumen_turboquant.cpp for the kernel.
+// ─────────────────────────────────────────────────────────────────────────
+
+class TurboquantFusedAttn : public Primitive {
+ public:
+  explicit TurboquantFusedAttn(Stream stream, float scale)
+      : Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<array>& /*inputs*/,
+      std::vector<array>& /*outputs*/) override {
+    throw std::runtime_error(
+        "lumen::TurboquantFusedAttn: CPU evaluation not implemented");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override;
+
+  const char* name() const override {
+    return "LumenTurboquantFusedAttn";
+  }
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& o = static_cast<const TurboquantFusedAttn&>(other);
+    return scale_ == o.scale_;
+  }
+
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override {
+    const auto& q = inputs[0];           // [B, H, T, D]
+    return {{q.shape(0), q.shape(1), q.shape(2), q.shape(3)}};
+  }
+
+  float scale() const { return scale_; }
+
+ private:
+  float scale_;
+};
+
+/// Build a lazy array node for the fused TurboQuant attention. See class
+/// doc above for shape/dtype constraints. `scale` is the standard attn
+/// scale (= 1/sqrt(head_dim)) optionally multiplied by external softcap.
+array turboquant_fused_attn(
+    const array& q,
+    const array& k_codes,
+    const array& k_sigma,
+    const array& v_codes,
+    const array& v_sigma,
+    const array& centroids,
+    float scale,
+    StreamOrDevice stream = {});
+
+// ─────────────────────────────────────────────────────────────────────────
 // TurboquantEncodeFusedPacked4 — same as TurboquantEncodeFused but emits
 // 4-bit codes packed into uint32 (8 codes per word). Halves K/V cache
 // storage and the inline-kernel DRAM read bandwidth.

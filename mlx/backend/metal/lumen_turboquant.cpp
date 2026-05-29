@@ -779,6 +779,423 @@ kernel void lumen_tq_sv_inline(
         }
     }
 }
+
+// ── sv_inline v3 ─ uchar4 vectorized V_codes load ────────────────────────
+// Same threading pattern + memory layout as v2; only the V_codes load
+// changes from byte-by-byte `v_row[k]` (32 individual 1-byte loads per
+// N-iteration per thread) to `uchar4` vector (8 4-byte loads per
+// N-iteration per thread). Apple Silicon GPU coalesces the 4-byte loads
+// into a single transaction, cutting DRAM ops 4× on the V_codes side.
+//
+// Constraint: D_TILE_PER_SG must be a multiple of 4 (it's 32 — safe).
+// V_codes pointer must be 4-byte aligned (`v_codes_base + n*D + d_base`
+// — D is multiple of 64 on Gemma 4, d_base is multiple of 32, so the
+// effective offset is multiple of 32 ≥ 4 → aligned).
+
+kernel void lumen_tq_sv_inline_v3(
+    device const bfloat* __restrict__ S         [[buffer(0)]],
+    device const uchar*  __restrict__ V_codes   [[buffer(1)]],
+    device const float*  __restrict__ V_sigma   [[buffer(2)]],
+    device const float*  __restrict__ centroids [[buffer(3)]],
+    device       bfloat*              O         [[buffer(4)]],
+    constant uint& B    [[buffer(5)]],
+    constant uint& H    [[buffer(6)]],
+    constant uint& H_kv [[buffer(7)]],
+    constant uint& T    [[buffer(8)]],
+    constant uint& N    [[buffer(9)]],
+    constant uint& D    [[buffer(10)]],
+    constant uint& n_levels [[buffer(11)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]
+) {
+    threadgroup float centroids_tg[TQ_SV_MAX_NCENTROIDS];
+
+    const uint d_tile_idx = tid.x;
+    const uint t          = tid.y;
+    const uint bh         = tid.z;
+    const uint b          = bh / H;
+    const uint h          = bh % H;
+    const uint h_kv       = h * H_kv / H;
+    const uint d_base     = d_tile_idx * TQ_SV_D_TILE_PER_TG
+                          + simd_gid * TQ_SV_D_TILE_PER_SG;
+
+    if (simd_gid == 0 && simd_lid < n_levels) {
+        centroids_tg[simd_lid] = centroids[simd_lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint s_base       = ((b * H    + h)    * T + t) * N;
+    const uint sigma_base   = (b * H_kv  + h_kv) * N;
+    const uint v_codes_base = (b * H_kv  + h_kv) * N * D;
+
+    float result[TQ_SV_D_TILE_PER_SG] = {0};
+
+    for (uint n_chunk = 0; n_chunk < N; n_chunk += TQ_SV_SIMD_WIDTH) {
+        uint n = n_chunk + simd_lid;
+        float w_n = 0.0f;
+        if (n < N) {
+            float x_n   = float(S[s_base + n]);
+            float sig_n = V_sigma[sigma_base + n];
+            w_n = x_n * sig_n;
+        }
+        if (n < N) {
+            // Cast to uchar4 for 4-byte vector loads. D_TILE_PER_SG/4 = 8
+            // loads of 4 bytes vs 32 loads of 1 byte (v2). Apple Metal
+            // coalesces aligned 4-byte loads into a single DRAM transaction.
+            device const uchar4* v_row4 = (device const uchar4*)(
+                V_codes + v_codes_base + n * D + d_base);
+            #pragma clang loop unroll(full)
+            for (uint k4 = 0; k4 < TQ_SV_D_TILE_PER_SG / 4; k4++) {
+                uchar4 codes4 = v_row4[k4];
+                const uint k = k4 * 4;
+                result[k + 0] = fma(w_n, centroids_tg[codes4.x], result[k + 0]);
+                result[k + 1] = fma(w_n, centroids_tg[codes4.y], result[k + 1]);
+                result[k + 2] = fma(w_n, centroids_tg[codes4.z], result[k + 2]);
+                result[k + 3] = fma(w_n, centroids_tg[codes4.w], result[k + 3]);
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < TQ_SV_D_TILE_PER_SG; k++) {
+        float sum = simd_sum(result[k]);
+        if (simd_lid == 0) {
+            uint d_out = d_base + k;
+            if (d_out < D) {
+                O[((b * H + h) * T + t) * D + d_out] = bfloat(sum);
+            }
+        }
+    }
+}
+
+// ── TurboQuant fused attention (online softmax + inline K/V dequant) ─────
+//
+// Computes O[B, H, T=1, D] = softmax(Q · K_dq^T / sqrt(D)) · V_dq in a
+// single dispatch. Mirrors mlx's `sdpa_vector` flash-attention pattern but
+// loads K and V via Lloyd-Max inline dequant (centroids LUT × per-vector σ)
+// instead of bf16 reads. Eliminates the qk_inline + softmax + sv_inline
+// 3-dispatch chain currently used for the TQ decode path.
+//
+// Shape:
+//   Q         : bfloat16 [B, H,    T, D]   (T must equal 1 for now)
+//   K_codes   : uint8    [B, H_kv, N, D]
+//   K_sigma   : float32  [B, H_kv, N]
+//   V_codes   : uint8    [B, H_kv, N, D]
+//   V_sigma   : float32  [B, H_kv, N]
+//   centrds   : float32  [n_levels]        (Lloyd-Max LUT; n_levels ≤ 16)
+//   O         : bfloat16 [B, H,    T, D]
+//
+// Threading (sdpa_vector layout, source-duplicated for D = {256, 512}):
+//   - BN = 32 simdgroups per threadgroup, BD = 32 threads/SG = simd width
+//   - Each thread holds qk_per_thread = D/BD = {8, 16} elements of Q
+//     plus v_per_thread = D/BD elements of running V accumulator
+//   - Each simdgroup processes N rows i = simd_gid, simd_gid + BN, ...
+//   - Within a simdgroup, simd_lid covers the D dimension (one BD slice
+//     per thread); simd_sum reduces the partial QK score
+//   - Online softmax: register-resident max_score, sum_exp_score updated
+//     per N row; final cross-simdgroup reduce in threadgroup memory
+//
+// Inline dequant pattern (matches sv_inline / qk_inline math, just fused):
+//   k[j]  = centroids[K_codes[b, h_kv, i, d_thread + j]] * K_sigma[b, h_kv, i]
+//   v[j]  = centroids[V_codes[b, h_kv, i, d_thread + j]] * V_sigma[b, h_kv, i]
+//
+// Constraints:
+//   - T == 1 (decode shape)
+//   - D ∈ {256, 512}  (source-duplicated kernel pairs)
+//   - n_levels ≤ 16  (bits ≤ 4)
+//   - H % H_kv == 0  (GQA)
+
+constant uint TQ_FA_MAX_NCENTROIDS = 16;
+constant uint TQ_FA_BN             = 32;  // simdgroups per TG
+constant uint TQ_FA_BD             = 32;  // threads per SG (= simd width)
+
+// D=256 variant (sliding head_dim).
+kernel void lumen_tq_fused_attn_d256(
+    const device bfloat* __restrict__ Q         [[buffer(0)]],
+    const device uchar*  __restrict__ K_codes   [[buffer(1)]],
+    const device float*  __restrict__ K_sigma   [[buffer(2)]],
+    const device uchar*  __restrict__ V_codes   [[buffer(3)]],
+    const device float*  __restrict__ V_sigma   [[buffer(4)]],
+    const device float*  __restrict__ centroids [[buffer(5)]],
+    device       bfloat*              O         [[buffer(6)]],
+    constant uint& B        [[buffer(7)]],
+    constant uint& H        [[buffer(8)]],
+    constant uint& H_kv     [[buffer(9)]],
+    constant uint& T_q      [[buffer(10)]],
+    constant uint& N        [[buffer(11)]],
+    constant uint& n_levels [[buffer(12)]],
+    constant float& scale   [[buffer(13)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]
+) {
+    constexpr uint D = 256;
+    constexpr uint qk_per_thread = D / TQ_FA_BD;   // 8
+    constexpr uint v_per_thread  = D / TQ_FA_BD;   // 8
+
+    typedef float U;
+
+    thread U q[qk_per_thread];
+    thread U k[qk_per_thread];
+    thread U o[v_per_thread];
+
+    threadgroup float centroids_tg[TQ_FA_MAX_NCENTROIDS];
+    threadgroup U max_scores[TQ_FA_BN];
+    threadgroup U sum_exp_scores[TQ_FA_BN];
+    threadgroup U outputs[TQ_FA_BN * TQ_FA_BD];
+
+    // Cooperative centroids LUT load (first n_levels threads of first SG).
+    if (simd_gid == 0 && simd_lid < n_levels) {
+        centroids_tg[simd_lid] = centroids[simd_lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Grid: (B*H, T_q, 1). T_q must be 1 — guarded host-side.
+    const uint q_batch_head_idx = tid.x;
+    const uint t                = tid.y;
+    const uint b                = q_batch_head_idx / H;
+    const uint h                = q_batch_head_idx % H;
+    const uint h_kv             = h * H_kv / H;
+
+    const uint q_offset       = ((b * H    + h)    * T_q + t) * D;
+    const uint kv_code_base   = (b * H_kv  + h_kv) * N   * D;
+    const uint sigma_base     = (b * H_kv  + h_kv) * N;
+    const uint o_offset       = q_offset;
+
+    // Load Q with attention scale. thread `simd_lid` holds D-slice
+    // [simd_lid * qk_per_thread, (simd_lid + 1) * qk_per_thread).
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < qk_per_thread; j++) {
+        q[j] = U(scale) * U(Q[q_offset + simd_lid * qk_per_thread + j]);
+    }
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < v_per_thread; j++) {
+        o[j] = 0;
+    }
+
+    U max_score = -INFINITY;
+    U sum_exp_score = 0;
+
+    // Iterate over N (KV positions). simd_gid stripes the N dimension
+    // across the BN simdgroups — each SG handles rows i = simd_gid,
+    // simd_gid + BN, ...
+    for (uint i = simd_gid; i < N; i += TQ_FA_BN) {
+        // Load K row: dequant inline. simd_lid handles its D-slice.
+        const uint k_row_base = kv_code_base + i * D + simd_lid * qk_per_thread;
+        const U    k_sig      = K_sigma[sigma_base + i];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < qk_per_thread; j++) {
+            uchar code = K_codes[k_row_base + j];
+            k[j] = centroids_tg[code] * k_sig;
+        }
+
+        // Compute partial score over the thread's D-slice + simd-wide
+        // reduce to get the full score for this (q, k_i).
+        U score = 0;
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+        }
+        score = simd_sum(score);
+
+        // Online softmax accumulation.
+        U new_max = max(max_score, score);
+        U factor    = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score     - new_max);
+
+        max_score     = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        // Load V row inline-dequant and update output accumulator.
+        const uint v_row_base = kv_code_base + i * D + simd_lid * v_per_thread;
+        const U    v_sig      = V_sigma[sigma_base + i];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < v_per_thread; j++) {
+            uchar code = V_codes[v_row_base + j];
+            U v_val = centroids_tg[code] * v_sig;
+            o[j] = o[j] * factor + exp_score * v_val;
+        }
+    }
+
+    // Cross-simdgroup reduction of max_score + sum_exp_score (BN partial
+    // streams → one global stream).
+    if (simd_lid == 0) {
+        max_scores[simd_gid]     = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread reads one BN value (simd_lid < BN), simd reduce gives
+    // global max / sum. simd_lid runs 0..BD-1 = 0..31 and BN=32 — perfect
+    // alignment so all 32 threads of SG 0 read all BN entries.
+    U sg_max = max_scores[simd_lid];
+    U new_max = simd_max(sg_max);
+    U factor    = fast::exp(sg_max - new_max);
+    U sg_sum    = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    // Aggregate outputs (mlx sdpa_vector pattern). Per-iteration:
+    //   1. each thread (simd_lid, simd_gid) writes its o[j] into
+    //      outputs[simd_lid * BD + simd_gid] — fills a 32×32 staging tile
+    //   2. threadgroup barrier so all writes are visible
+    //   3. each thread (simd_lid, simd_gid) reads outputs[simd_gid * BD +
+    //      simd_lid] (transposed access) and simd_sum across the
+    //      simdgroup, weighted by factor (which is simd_lid-dependent).
+    //   4. divide by global sum_exp; store back into register o[j]
+    //
+    // After the v_per_thread loop completes, each simdgroup `simd_gid`
+    // owns the contiguous v_per_thread elements of the final output at
+    // offset (simd_gid * v_per_thread). simd_lid==0 writes those out.
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < v_per_thread; j++) {
+        outputs[simd_lid * TQ_FA_BD + simd_gid] = o[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        U partial  = outputs[simd_gid * TQ_FA_BD + simd_lid];
+        U combined = simd_sum(partial * factor);
+        if (sg_sum != 0) {
+            combined = combined / sg_sum;
+        }
+        o[j] = combined;  // store back into register
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (simd_lid == 0) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < v_per_thread; j++) {
+            const uint d_out = simd_gid * v_per_thread + j;
+            O[o_offset + d_out] = bfloat(o[j]);
+        }
+    }
+}
+
+// D=512 variant (full-attn global_head_dim). Same algorithm, larger
+// per-thread D slice (qk_per_thread = 16). Register pressure ≈ 16*4 + 16*4
+// + 16*4 = 192 B/thread for q/k/o — within Apple Silicon thread context.
+kernel void lumen_tq_fused_attn_d512(
+    const device bfloat* __restrict__ Q         [[buffer(0)]],
+    const device uchar*  __restrict__ K_codes   [[buffer(1)]],
+    const device float*  __restrict__ K_sigma   [[buffer(2)]],
+    const device uchar*  __restrict__ V_codes   [[buffer(3)]],
+    const device float*  __restrict__ V_sigma   [[buffer(4)]],
+    const device float*  __restrict__ centroids [[buffer(5)]],
+    device       bfloat*              O         [[buffer(6)]],
+    constant uint& B        [[buffer(7)]],
+    constant uint& H        [[buffer(8)]],
+    constant uint& H_kv     [[buffer(9)]],
+    constant uint& T_q      [[buffer(10)]],
+    constant uint& N        [[buffer(11)]],
+    constant uint& n_levels [[buffer(12)]],
+    constant float& scale   [[buffer(13)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]
+) {
+    constexpr uint D = 512;
+    constexpr uint qk_per_thread = D / TQ_FA_BD;   // 16
+    constexpr uint v_per_thread  = D / TQ_FA_BD;   // 16
+
+    typedef float U;
+
+    thread U q[qk_per_thread];
+    thread U k[qk_per_thread];
+    thread U o[v_per_thread];
+
+    threadgroup float centroids_tg[TQ_FA_MAX_NCENTROIDS];
+    threadgroup U max_scores[TQ_FA_BN];
+    threadgroup U sum_exp_scores[TQ_FA_BN];
+    threadgroup U outputs[TQ_FA_BN * TQ_FA_BD];
+
+    if (simd_gid == 0 && simd_lid < n_levels) {
+        centroids_tg[simd_lid] = centroids[simd_lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint q_batch_head_idx = tid.x;
+    const uint t                = tid.y;
+    const uint b                = q_batch_head_idx / H;
+    const uint h                = q_batch_head_idx % H;
+    const uint h_kv             = h * H_kv / H;
+
+    const uint q_offset       = ((b * H    + h)    * T_q + t) * D;
+    const uint kv_code_base   = (b * H_kv  + h_kv) * N   * D;
+    const uint sigma_base     = (b * H_kv  + h_kv) * N;
+    const uint o_offset       = q_offset;
+
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < qk_per_thread; j++) {
+        q[j] = U(scale) * U(Q[q_offset + simd_lid * qk_per_thread + j]);
+    }
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < v_per_thread; j++) {
+        o[j] = 0;
+    }
+
+    U max_score = -INFINITY;
+    U sum_exp_score = 0;
+
+    for (uint i = simd_gid; i < N; i += TQ_FA_BN) {
+        const uint k_row_base = kv_code_base + i * D + simd_lid * qk_per_thread;
+        const U    k_sig      = K_sigma[sigma_base + i];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < qk_per_thread; j++) {
+            uchar code = K_codes[k_row_base + j];
+            k[j] = centroids_tg[code] * k_sig;
+        }
+
+        U score = 0;
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+        }
+        score = simd_sum(score);
+
+        U new_max   = max(max_score, score);
+        U factor    = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score     - new_max);
+
+        max_score     = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        const uint v_row_base = kv_code_base + i * D + simd_lid * v_per_thread;
+        const U    v_sig      = V_sigma[sigma_base + i];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < v_per_thread; j++) {
+            uchar code = V_codes[v_row_base + j];
+            U v_val = centroids_tg[code] * v_sig;
+            o[j] = o[j] * factor + exp_score * v_val;
+        }
+    }
+
+    if (simd_lid == 0) {
+        max_scores[simd_gid]     = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U sg_max = max_scores[simd_lid];
+    U new_max = simd_max(sg_max);
+    U factor  = fast::exp(sg_max - new_max);
+    U sg_sum  = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < v_per_thread; j++) {
+        outputs[simd_lid * TQ_FA_BD + simd_gid] = o[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        U partial  = outputs[simd_gid * TQ_FA_BD + simd_lid];
+        U combined = simd_sum(partial * factor);
+        if (sg_sum != 0) {
+            combined = combined / sg_sum;
+        }
+        o[j] = combined;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (simd_lid == 0) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < v_per_thread; j++) {
+            const uint d_out = simd_gid * v_per_thread + j;
+            O[o_offset + d_out] = bfloat(o[j]);
+        }
+    }
+}
 )KMETAL";
 
 } // anonymous namespace
@@ -1197,7 +1614,12 @@ void TurboquantSvInline::eval_gpu(
   auto lib = d.get_library(tq_lib_name(), []() {
     return std::string(TQ_SHADER_SRC);
   });
-  auto kernel = d.get_kernel("lumen_tq_sv_inline", lib);
+  // v3 = uchar4 vectorized V_codes load (4× DRAM transactions reduction).
+  // Same threading layout as v2 — output is bit-equivalent.
+  const char* env_v3 = std::getenv("LUMEN_TQ_SV_INLINE_V3");
+  const bool use_v3 = env_v3 != nullptr && env_v3[0] == '1';
+  auto kernel = d.get_kernel(
+      use_v3 ? "lumen_tq_sv_inline_v3" : "lumen_tq_sv_inline", lib);
 
   auto& enc = metal::get_command_encoder(stream_);
   enc.set_compute_pipeline_state(kernel);
@@ -1278,6 +1700,80 @@ void TurboquantRotEncodeFused::eval_gpu(
   uint32_t n_rows = static_cast<uint32_t>(x.size() / D);
   MTL::Size grid = MTL::Size(n_rows, 1, 1);
   MTL::Size tg = MTL::Size(D, 1, 1);
+  enc.dispatch_threadgroups(grid, tg);
+}
+
+void TurboquantFusedAttn::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  const auto& q         = inputs[0]; // bf16  [B, H, T, D]
+  const auto& k_codes   = inputs[1]; // uint8 [B, H_kv, N, D]
+  const auto& k_sigma   = inputs[2]; // f32   [B, H_kv, N]
+  const auto& v_codes   = inputs[3]; // uint8 [B, H_kv, N, D]
+  const auto& v_sigma   = inputs[4]; // f32   [B, H_kv, N]
+  const auto& centroids = inputs[5]; // f32   [n_levels]
+  auto& out             = outputs[0]; // bf16 [B, H, T, D]
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  if (out.size() == 0) {
+    return;
+  }
+
+  auto& stream_ = stream();
+  auto& d = metal::device(stream_.device);
+
+  auto lib = d.get_library(tq_lib_name(), []() {
+    return std::string(TQ_SHADER_SRC);
+  });
+
+  // Source-duplicated kernels — dispatch by D. Q/K/V/O all share head_dim.
+  uint32_t B    = static_cast<uint32_t>(q.shape(0));
+  uint32_t H    = static_cast<uint32_t>(q.shape(1));
+  uint32_t T    = static_cast<uint32_t>(q.shape(2));
+  uint32_t D_   = static_cast<uint32_t>(q.shape(3));
+  uint32_t H_kv = static_cast<uint32_t>(k_codes.shape(1));
+  uint32_t N    = static_cast<uint32_t>(k_codes.shape(2));
+  uint32_t n_levels = static_cast<uint32_t>(centroids.size());
+  float    scale_val = scale();
+
+  const char* kernel_name = nullptr;
+  if (D_ == 256) {
+    kernel_name = "lumen_tq_fused_attn_d256";
+  } else if (D_ == 512) {
+    kernel_name = "lumen_tq_fused_attn_d512";
+  } else {
+    std::ostringstream msg;
+    msg << "[TurboquantFusedAttn] D must be 256 or 512, got " << D_;
+    throw std::invalid_argument(msg.str());
+  }
+  auto kernel = d.get_kernel(kernel_name, lib);
+
+  auto& enc = metal::get_command_encoder(stream_);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(q,         0);
+  enc.set_input_array(k_codes,   1);
+  enc.set_input_array(k_sigma,   2);
+  enc.set_input_array(v_codes,   3);
+  enc.set_input_array(v_sigma,   4);
+  enc.set_input_array(centroids, 5);
+  enc.set_output_array(out,      6);
+
+  enc.set_bytes(B,        7);
+  enc.set_bytes(H,        8);
+  enc.set_bytes(H_kv,     9);
+  enc.set_bytes(T,        10);
+  enc.set_bytes(N,        11);
+  enc.set_bytes(n_levels, 12);
+  enc.set_bytes(scale_val, 13);
+
+  // Grid: (B*H, T, 1) threadgroups × (BN * BD, 1, 1) threads.
+  // Matches sdpa_vector layout — one TG per (b, h, t) output position;
+  // online softmax + inline dequant runs inside that TG.
+  constexpr uint32_t BN = 32;  // simdgroups per TG
+  constexpr uint32_t BD = 32;  // threads per SG = simd width
+  MTL::Size grid = MTL::Size(B * H, T, 1);
+  MTL::Size tg   = MTL::Size(BN * BD, 1, 1);
   enc.dispatch_threadgroups(grid, tg);
 }
 

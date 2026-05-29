@@ -412,12 +412,21 @@ array turboquant_qk_inline(
   // K_codes / K_sigma typically come from a sliding-ring cache view whose
   // strides match the full ring (not the sliced extent). The kernel uses
   // linear indexing assuming packed shape, so materialize a contiguous copy
-  // before dispatch. Q and centroids are typically already contiguous; the
-  // `contiguous()` op is a no-op on already-contiguous inputs.
-  array q_c         = contiguous(q,         /*allow_col_major=*/false, s_);
-  array k_codes_c   = contiguous(k_codes,   /*allow_col_major=*/false, s_);
-  array k_sigma_c   = contiguous(k_sigma,   /*allow_col_major=*/false, s_);
-  array centroids_c = contiguous(centroids, /*allow_col_major=*/false, s_);
+  // before dispatch. Q and centroids are typically already contiguous; skip
+  // the contiguous() primitive when the input is already row-contiguous —
+  // mlx's `contiguous()` always emits a Contiguous primitive (verified
+  // 2026-05-26 via primhist: best-TQ Contiguous=240/step ≈ 4 calls × 2
+  // kernels × 30 layers, all from this and sv_inline; eliminating no-ops
+  // drops the count for the truly-contiguous inputs).
+  auto ensure_rc = [&](const array& a) -> array {
+    return a.flags().row_contiguous
+        ? a
+        : contiguous(a, /*allow_col_major=*/false, s_);
+  };
+  array q_c         = ensure_rc(q);
+  array k_codes_c   = ensure_rc(k_codes);
+  array k_sigma_c   = ensure_rc(k_sigma);
+  array centroids_c = ensure_rc(centroids);
   return array(
       std::move(out_shape),
       bfloat16,
@@ -526,8 +535,166 @@ array turboquant_sv_inline(
   // V_codes / V_sigma typically come from a sliding-ring cache view whose
   // strides match the full ring (not the sliced extent). The kernel uses
   // linear indexing assuming packed shape, so materialize a contiguous copy
-  // before dispatch — same bug fix as the Q@K_codes kernel.
-  array s_c         = contiguous(s,         /*allow_col_major=*/false, s_);
+  // before dispatch — same bug fix as the Q@K_codes kernel. Skip the
+  // primitive when input is already row-contiguous (see qk_inline above
+  // for the primhist rationale).
+  auto ensure_rc_sv = [&](const array& a) -> array {
+    return a.flags().row_contiguous
+        ? a
+        : contiguous(a, /*allow_col_major=*/false, s_);
+  };
+  array s_c         = ensure_rc_sv(s);
+  array v_codes_c   = ensure_rc_sv(v_codes);
+  array v_sigma_c   = ensure_rc_sv(v_sigma);
+  array centroids_c = ensure_rc_sv(centroids);
+
+  auto stream_ = to_stream(s_);
+  Shape out_shape = {B, H, T, D};
+  return array(
+      std::move(out_shape),
+      bfloat16,
+      std::make_shared<TurboquantSvInline>(stream_),
+      {s_c, v_codes_c, v_sigma_c, centroids_c});
+}
+
+array turboquant_fused_attn(
+    const array& q,
+    const array& k_codes,
+    const array& k_sigma,
+    const array& v_codes,
+    const array& v_sigma,
+    const array& centroids,
+    float scale,
+    StreamOrDevice s_) {
+  // ── dtype checks ──
+  if (q.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] q must be bfloat16, got "
+        << q.dtype();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_codes.dtype() != uint8 || v_codes.dtype() != uint8) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] k_codes and v_codes must be uint8");
+  }
+  if (k_sigma.dtype() != float32 || v_sigma.dtype() != float32) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] k_sigma and v_sigma must be float32");
+  }
+  if (centroids.dtype() != float32) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] centroids must be float32");
+  }
+
+  // ── rank + shape checks ──
+  if (q.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] q must be rank-4 [B,H,T,D], got "
+        << q.shape();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_codes.ndim() != 4 || v_codes.ndim() != 4) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] k_codes/v_codes must be rank-4 "
+        "[B,H_kv,N,D]");
+  }
+  if (k_sigma.ndim() != 3 || v_sigma.ndim() != 3) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] k_sigma/v_sigma must be rank-3 "
+        "[B,H_kv,N]");
+  }
+  if (centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[lumen::turboquant_fused_attn] centroids must be rank-1");
+  }
+
+  int B    = q.shape(0);
+  int H    = q.shape(1);
+  int T    = q.shape(2);
+  int D    = q.shape(3);
+  int H_kv = k_codes.shape(1);
+  int N    = k_codes.shape(2);
+
+  if (T != 1) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] T must be 1 (decode shape), got "
+        << T;
+    throw std::invalid_argument(msg.str());
+  }
+  if (D != 256 && D != 512) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] D must be 256 (sliding) or 512 "
+           "(full-attn), got " << D;
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_codes.shape(0) != B || k_codes.shape(3) != D) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] k_codes shape " << k_codes.shape()
+        << " must be [B=" << B << ",H_kv,N," << D << "]";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_codes.shape(0) != B || v_codes.shape(1) != H_kv ||
+      v_codes.shape(2) != N || v_codes.shape(3) != D) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] v_codes shape " << v_codes.shape()
+        << " must match k_codes shape " << k_codes.shape();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_sigma.shape(0) != B || k_sigma.shape(1) != H_kv ||
+      k_sigma.shape(2) != N) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] k_sigma shape " << k_sigma.shape()
+        << " must be [B=" << B << ",H_kv=" << H_kv << ",N=" << N << "]";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_sigma.shape(0) != B || v_sigma.shape(1) != H_kv ||
+      v_sigma.shape(2) != N) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] v_sigma shape " << v_sigma.shape()
+        << " must be [B=" << B << ",H_kv=" << H_kv << ",N=" << N << "]";
+    throw std::invalid_argument(msg.str());
+  }
+  if (H_kv == 0 || H % H_kv != 0) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] H=" << H
+        << " must be a non-zero multiple of H_kv=" << H_kv;
+    throw std::invalid_argument(msg.str());
+  }
+  int n_levels = centroids.shape(0);
+  if (n_levels < 2 || n_levels > 16) {
+    std::ostringstream msg;
+    msg << "[lumen::turboquant_fused_attn] n_levels must be in [2, 16], got "
+        << n_levels;
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Unconditional contiguous() required for correctness (2026-05-26): with
+  // flag-based skip (a.flags().row_contiguous ? a : contiguous(a, ...))
+  // e2e produced garbage output even though row_contiguous reported true
+  // for all 6 inputs. Diagnostic logging confirmed flags = (1,1,1,1,1,1)
+  // matched isolated unit-test conditions, yet only the unconditional
+  // path produces sane decode tokens. Hypothesis: the extra Contiguous
+  // primitive (no-op when input is already RC) acts as an implicit
+  // evaluation barrier that resolves an mlx graph ordering bug specific
+  // to this fused kernel's input set.
+  //
+  // Cost: +180 Contiguous primitives/step at decode (6 inputs × 30 layers).
+  // mlx evaluates these as no-ops when row_contiguous=true so GPU time is
+  // ~0, but primitive overhead is ~1-2 µs each ≈ 180-360 µs/step.
+  // Combined with the 2-dispatch saving per layer from fused (~720 µs/step),
+  // the algebra suggests a small net win — but end-to-end measurement
+  // (2026-05-26 cooldown-bracketed) shows fused_attn delivers −7.4% decode
+  // vs the 3-dispatch (qk_inline + softmax_axis + sv_inline) baseline.
+  // The custom online-softmax kernel is slower than mlx's tuned individual
+  // kernels, consistent with the v3 sv_inline finding that mlx's tile-MMA
+  // matmul beats hand-written Metal at these shapes.
+  //
+  // **fused_attn is shipped behind LUMEN_GEMMA4_TQ_FUSED_ATTN=1 (default
+  // OFF)** for future revisit when a tile-MMA rewrite of the kernel is
+  // possible. Until then it's not on the production path.
+  array q_c         = contiguous(q,         /*allow_col_major=*/false, s_);
+  array k_codes_c   = contiguous(k_codes,   /*allow_col_major=*/false, s_);
+  array k_sigma_c   = contiguous(k_sigma,   /*allow_col_major=*/false, s_);
   array v_codes_c   = contiguous(v_codes,   /*allow_col_major=*/false, s_);
   array v_sigma_c   = contiguous(v_sigma,   /*allow_col_major=*/false, s_);
   array centroids_c = contiguous(centroids, /*allow_col_major=*/false, s_);
@@ -537,8 +704,8 @@ array turboquant_sv_inline(
   return array(
       std::move(out_shape),
       bfloat16,
-      std::make_shared<TurboquantSvInline>(stream_),
-      {s_c, v_codes_c, v_sigma_c, centroids_c});
+      std::make_shared<TurboquantFusedAttn>(stream_, scale),
+      {q_c, k_codes_c, k_sigma_c, v_codes_c, v_sigma_c, centroids_c});
 }
 
 std::vector<array> turboquant_encode_fused_packed4(
@@ -654,10 +821,13 @@ array turboquant_qk_inline_packed4(
     throw std::invalid_argument(msg.str());
   }
 
-  array q_c           = contiguous(q,           false, s_);
-  array k_codes_pkd_c = contiguous(k_codes_pkd, false, s_);
-  array k_sigma_c     = contiguous(k_sigma,     false, s_);
-  array centroids_c   = contiguous(centroids,   false, s_);
+  auto ensure_rc_qkp = [&](const array& a) -> array {
+    return a.flags().row_contiguous ? a : contiguous(a, false, s_);
+  };
+  array q_c           = ensure_rc_qkp(q);
+  array k_codes_pkd_c = ensure_rc_qkp(k_codes_pkd);
+  array k_sigma_c     = ensure_rc_qkp(k_sigma);
+  array centroids_c   = ensure_rc_qkp(centroids);
 
   auto s = to_stream(s_);
   Shape out_shape = {B, H, T, N};
