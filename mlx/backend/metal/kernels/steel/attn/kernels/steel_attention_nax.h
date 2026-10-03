@@ -201,6 +201,14 @@ template <
       }
     }
   }
+  // See steel_attention.h: the last K position outside the window of the
+  // tile's last row.
+  const int window_edge =
+      int(tid.x + 1) * BQ + params->qL_off - 1 - params->window_size;
+  // K and V start at block 0 and advance one block per iteration; starting
+  // the loop at kb_start needs them moved there too (see steel_attention.h).
+  K += kb_start * BK * int(params->K_strides[2]);
+  V += kb_start * BK * int(params->V_strides[2]);
 
   const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
@@ -349,8 +357,10 @@ template <
       }
     }
 
-    // Mask out if outside sliding window (left edge of band).
-    if (has_window && kb < (kb_start + ((BQ + BK - 1) / BK))) {
+    // Mask out if outside sliding window (left edge of band): every block
+    // that starts at or before `window_edge` (see steel_attention.h).
+    // Positions are `int`: a `short` wraps past 32,767 tokens.
+    if (has_window && kb * BK <= window_edge) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = tid.x * BQ + params->qL_off + tm;
@@ -360,8 +370,8 @@ template <
       for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          const short row_pos = base_row + iq * UQ;
-          const short col_pos = base_col + ik * UK;
+          const int row_pos = base_row + iq * UQ;
+          const int col_pos = base_col + ik * UK;
 
           thread auto& fg = Ptile.subtile_at(iq, ik).frag_at(0, 0);
 

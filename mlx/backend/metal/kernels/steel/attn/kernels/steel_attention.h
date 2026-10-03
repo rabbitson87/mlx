@@ -271,6 +271,16 @@ template <
       }
     }
   }
+  // The last K position that is outside the window of the tile's LAST row.
+  // A block starting at or before it holds cells some row must not see.
+  const int window_edge =
+      int(tid.x + 1) * BQ + params->qL_off - 1 - params->window_size;
+  // The loaders were built at K/V block 0 and advance one block per
+  // iteration, so starting the loop at kb_start needs them moved there too.
+  // Without it, every Q tile past the first window computed against blocks
+  // 0.. while masking as if they were kb_start.. — the wrong keys entirely.
+  loader_k.src += kb_start * loader_k.tile_stride;
+  loader_v.src += kb_start * loader_v.tile_stride;
 
   // Loop over KV seq length
   for (int kb = kb_start; kb < kb_lim; kb++) {
@@ -345,10 +355,11 @@ template <
       }
     }
 
-    // Mask out if outside sliding window (left edge of band).
-    // Only the first ceil(BQ / BK) blocks past kb_start can have any
-    // cells whose absolute K position is below row_pos - W + 1.
-    if (has_window && kb < (kb_start + ((BQ + BK - 1) / BK))) {
+    // Mask out if outside sliding window (left edge of band): every block
+    // that starts at or before `window_edge`. Counting ceil(BQ / BK) blocks
+    // past kb_start fell one block short whenever q_min - W + 1 was not
+    // block-aligned, and those keys stayed visible to the tile's lower rows.
+    if (has_window && kb * BK <= window_edge) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = Limits<selem_t>::finite_min;
