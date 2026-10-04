@@ -134,7 +134,7 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
 }
 
 MTL::Library* load_default_library(MTL::Device* device) {
-  NS::Error* error[5];
+  NS::Error* error[6];
   MTL::Library* lib;
   // First try the colocated mlx.metallib
   std::tie(lib, error[0]) = load_colocated_library(device, "mlx");
@@ -147,25 +147,35 @@ MTL::Library* load_default_library(MTL::Device* device) {
     return lib;
   }
 
+  // An executable inside a macOS app bundle lives in Contents/MacOS, and the
+  // bundle's data belongs in Contents/Resources, where code signing seals it.
+  // Shipping the metallib there means nothing has to be written next to the
+  // executable at run time — a write that breaks the bundle's seal, and fails
+  // outright when the app runs from a read-only disk image or is translocated.
+  std::tie(lib, error[2]) = load_colocated_library(device, "../Resources/mlx");
+  if (lib) {
+    return lib;
+  }
+
   // Then try default.metallib in a SwiftPM bundle if we have one
-  std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
+  std::tie(lib, error[3]) = load_swiftpm_library(device, "default");
   if (lib) {
     return lib;
   }
 
   // Try lo load resources from Framework resources if SwiftPM wrapped as a
   // dynamic framework.
-  std::tie(lib, error[3]) = load_colocated_library(device, "Resources/default");
+  std::tie(lib, error[4]) = load_colocated_library(device, "Resources/default");
   if (lib) {
     return lib;
   }
 
   // Finally try default_mtllib_path
-  std::tie(lib, error[4]) = load_library_from_path(device, default_mtllib_path);
+  std::tie(lib, error[5]) = load_library_from_path(device, default_mtllib_path);
   if (!lib) {
     std::ostringstream msg;
     msg << "Failed to load the default metallib. ";
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
       if (error[i] != nullptr) {
         msg << error[i]->localizedDescription()->utf8String() << " ";
       }
