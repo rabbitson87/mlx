@@ -644,18 +644,26 @@ bool ScaledDotProductAttention::use_fallback(
   // pushing close to the Apple Silicon ~256 B per-thread budget and likely
   // spilling to threadgroup memory or DRAM. The matmul fallback's tuned gemm
   // kernels handle D=512 better at decode-time Q-row=1 workloads.
-  // Kept the kernel instantiation in the .metal file so a future attempt
-  // (e.g. larger BD value, or split-D variant) can be enabled via the env
-  // gate `LUMEN_SDPA_VECTOR_D512=1`.
-  static const bool enable_sdpa_vector_d512 = []() {
+  // lumen-rs task 021 (2026-10-09): that loss is short-context only. With
+  // the two-pass kernel (>= 1024 keys) D=512 vector decode beats the fallback
+  // from MLX_SDPA_D512_MIN_KL keys on (upstream ml-explore/mlx #4459 gates the
+  // same way): Gemma 4 decode -8.5% at 32K, -10.7% at 64K end to end on an
+  // M3 Max. LUMEN_SDPA_VECTOR_D512=1 still forces it at every length, =0
+  // turns it off.
+  static const int sdpa_vector_d512_mode = []() {
     const char* v = std::getenv("LUMEN_SDPA_VECTOR_D512");
-    return v && std::string(v) == "1";
+    if (!v) {
+      return -1;
+    }
+    return std::string(v) == "1" ? 1 : 0;
   }();
+  const bool sdpa_vector_d512 = sdpa_vector_d512_mode == 1 ||
+      (sdpa_vector_d512_mode == -1 &&
+       key_sequence_length >= env::get_var("MLX_SDPA_D512_MIN_KL", 8192));
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 256 ||
-       (query_head_dim == 512 && enable_sdpa_vector_d512));
+       query_head_dim == 256 || (query_head_dim == 512 && sdpa_vector_d512));
   // lumen-rs 2026-05-15 — head_dim=256 added to instantiations
   // (steel_attention.metal / nax) but NOT enabled in the supported-head-dim
   // guard. Reason: on macOS < 26.2 (no NAX), the non-nax steel kernel uses
