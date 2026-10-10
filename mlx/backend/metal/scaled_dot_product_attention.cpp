@@ -821,7 +821,25 @@ std::tuple<bool, std::string> has_fused_kernel(
     // cost. By default, use it only for one query, GQA factor 8, and no array
     // mask.
     if (query_head_dim == 512) {
-      int min_key_sequence_length = env::get_var("MLX_SDPA_D512_MIN_KL", 1024);
+      // lumen-rs task 021: on an M3 Max the vector kernel beats the fallback
+      // from 8192 keys (Gemma 4 global layers: -11% per layer at 16K keys,
+      // -17% at 32K, 1K-8K within noise), so that is the default threshold.
+      // LUMEN_SDPA_VECTOR_D512=1 forces it at every length, =0 turns it off.
+      static const int lumen_d512_mode = []() {
+        const char* v = std::getenv("LUMEN_SDPA_VECTOR_D512");
+        if (!v) {
+          return -1;
+        }
+        return std::string(v) == "1" ? 1 : 0;
+      }();
+      if (lumen_d512_mode == 0) {
+        msg << "the vector attention kernel for head dim 512 is disabled by "
+               "LUMEN_SDPA_VECTOR_D512=0.";
+        return {false, msg.str()};
+      }
+      int min_key_sequence_length = lumen_d512_mode == 1
+          ? 0
+          : env::get_var("MLX_SDPA_D512_MIN_KL", 8192);
       bool always = (min_key_sequence_length == 0);
       if (!always && query_sequence_length != 1) {
         msg << "the vector attention kernel for head dim 512 defaults to "
