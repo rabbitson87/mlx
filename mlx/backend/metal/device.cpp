@@ -64,6 +64,21 @@ void set_compile_options(
 
 auto get_metal_version() {
   auto get_metal_version_ = []() {
+    // Test override: compile run-time kernels for an older macOS than this
+    // one, to check they still build there. lumen-rs runs its kernel tests
+    // with MLX_METAL_LANGUAGE_VERSION=3.1 — what macOS 14 compiles with — so a
+    // kernel that needs a newer Metal fails a test instead of a user's Mac.
+    // Unrecognized values are ignored.
+    if (const char* v = std::getenv("MLX_METAL_LANGUAGE_VERSION")) {
+      std::string requested(v);
+      if (requested == "3.1") {
+        return MTL::LanguageVersion3_1;
+      } else if (requested == "3.2") {
+        return MTL::LanguageVersion3_2;
+      } else if (requested == "4.0") {
+        return MTL::LanguageVersion4_0;
+      }
+    }
     if (__builtin_available(macOS 27, iOS 27, tvOS 27, visionOS 27, *)) {
       // TODO: Use MTL::LanguageVersion4_1 after metal-cpp_27 is released.
       return static_cast<MTL::LanguageVersion>((4 << 16) + 1);
